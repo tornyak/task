@@ -1,2 +1,2 @@
 # task
-Library for managing dependant and concurrent tasks
+Go library for managing dependant and concurrent tasks
