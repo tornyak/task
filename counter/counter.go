@@ -1,4 +1,4 @@
-package tasks
+package counter
 import "sync/atomic"
 
 type Counter struct {
