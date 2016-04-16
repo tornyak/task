@@ -9,53 +9,88 @@ import (
 )
 
 var (
-	ErrTimeout   = errors.New("Received timeout")
-	ErrInterrupt = errors.New("Received interrupt")
+	errTimeout   = errors.New("Received timeout")
+	errInterrupt = errors.New("Received interrupt")
 )
 
+const defaultRepeatTaskTmo = 100 * time.Millisecond
+
+// Runner is generic task runner for executing dependent tasks.
+// Tasks can be any datatype that implements task/Task interface
+// Each task is executed in its own goroutine returning result via channel
+// Runner can end its execution in following ways:
+// 1. All tasks finished their execution and returned
+// 2. There was interrupt sent on interrupt channel
+// 3. There was timeout
+// 4. A task with behavior TaskFailedAbort failed during execution
 type Runner struct {
 	interrupt  chan os.Signal   // OS interrupt signals
 	complete   chan error       // To report when processing is done
-	timeout    <-chan time.Time // To report timeout
-	resultChan chan Result
-	tasks      map[TaskID]Task
-	tasksNext  map[TaskID][]Task
-	tasksPrev  map[TaskID][]Task
+	timeout    <-chan time.Time // To report timeout for whole runner
+	resultChan chan Result      // channel for task results
+	tasks      map[ID]Task
+	tasksNext  map[ID][]Task // Tasks that depend on task TaskID
+	tasksPrev  map[ID][]Task // Tasks that are prerequisites for task TaskID
 }
 
+// NewRunner creates a new Runner instance
 func NewRunner(d time.Duration) *Runner {
 	return &Runner{
-		interrupt:  make(chan os.Signal, 1), // must use buffered channel, otherwise signal might be lost
-		complete:   make(chan error),        // channel for runner result
-		resultChan: make(chan Result),       // channel for task results
-		timeout:    time.After(d),           // Timeout for whole runner
-		tasks:      make(map[TaskID]Task),
-		tasksNext:  make(map[TaskID][]Task), // Tasks that depend on task TaskID
-		tasksPrev:  make(map[TaskID][]Task), // Tasks that are prerequisites for task TaskID
+		interrupt:  make(chan os.Signal, 1), // Must use buffered channel
+		complete:   make(chan error),
+		resultChan: make(chan Result),
+		timeout:    time.After(d),
+		tasks:      make(map[ID]Task),
+		tasksNext:  make(map[ID][]Task),
+		tasksPrev:  make(map[ID][]Task),
 	}
 }
 
+// Add adds one or more tasks to the runner
 func (r *Runner) Add(tasks ...Task) {
 	for _, t := range tasks {
-		r.tasks[t.GetId()] = t
-		r.tasksNext[t.GetId()] = []Task{}
-		r.tasksPrev[t.GetId()] = []Task{}
+		if t != nil {
+			r.tasks[t.GetID()] = t
+			r.tasksNext[t.GetID()] = []Task{}
+			r.tasksPrev[t.GetID()] = []Task{}
+		}
 	}
 }
 
 // AddDependency specifies t1->t2 dependency.
 // This means that t2 can be started only if t1 finished
-func (r *Runner) AddDependency(t1, t2 Task) {
-	r.tasksNext[t1.GetId()] = append(r.tasksNext[t1.GetId()], t2)
-	r.tasksPrev[t2.GetId()] = append(r.tasksPrev[t2.GetId()], t1)
+func (r *Runner) AddDependency(tasks ...Task) error {
+	if err := r.verifyTasksInRunner(tasks...); err != nil {
+		return err
+	}
+
+	for i := 0; i < len(tasks)-1; i++ {
+		t1, t2 := tasks[i], tasks[i+1]
+		r.tasksNext[t1.GetID()] = append(r.tasksNext[t1.GetID()], t2)
+		r.tasksPrev[t2.GetID()] = append(r.tasksPrev[t2.GetID()], t1)
+	}
+
+	return nil
 }
 
 // RemoveDependency removes dependency t1->t2
-func (r *Runner) RemoveDependency(t1, t2 Task) {
-	r.tasksNext[t1.GetId()] = removeTaskFromSlice(r.tasksNext[t1.GetId()], t2)
-	r.tasksPrev[t2.GetId()] = removeTaskFromSlice(r.tasksPrev[t2.GetId()], t1)
+func (r *Runner) RemoveDependency(tasks ...Task) error {
+
+	if err := r.verifyTasksInRunner(tasks...); err != nil {
+		return err
+	}
+
+	for i := 0; i < len(tasks)-1; i++ {
+		t1, t2 := tasks[i], tasks[i+1]
+		r.tasksNext[t1.GetID()] = removeTaskFromSlice(r.tasksNext[t1.GetID()], t2)
+		r.tasksPrev[t2.GetID()] = removeTaskFromSlice(r.tasksPrev[t2.GetID()], t1)
+	}
+
+	return nil
 }
 
+// Start starts execution of tasks in Runner
+// goroutine that called Start will remain blocked untill runner finishes execution
 func (r *Runner) Start() error {
 	// receive all interrupt based signals
 	signal.Notify(r.interrupt, os.Interrupt)
@@ -68,7 +103,7 @@ func (r *Runner) Start() error {
 	case err := <-r.complete:
 		return err
 	case <-r.timeout:
-		return ErrTimeout
+		return errTimeout
 	}
 }
 
@@ -86,36 +121,39 @@ func (r *Runner) run() error {
 	for len(waitingTasks) > 0 || len(runningTasks) > 0 {
 		// Check for interrupt from OS
 		if r.gotInterrupt() {
-			return ErrInterrupt
+			return errInterrupt
 		}
 		for _, t := range waitingTasks {
 			t.SetState(TaskStateRunning)
 
-			fmt.Printf("Run: %v\n", t)
+			runningTasks = append(runningTasks, t)
 			// Execute the registered task
 			go t.Run(r.resultChan)
 		}
-		runningTasks = append(runningTasks, waitingTasks...)
 		waitingTasks = []Task{}
 
 		select {
 		case result := <-r.resultChan:
 			doneTask := r.tasks[result.ID]
-			fmt.Printf("Task Done: %v\n", doneTask)
 			runningTasks = removeTaskFromSlice(runningTasks, doneTask)
 			// Handle error
 			if result.Err != nil {
 				doneTask.SetState(TaskStateFailed)
 				switch doneTask.GetFailedBehavior() {
 				case TaskFailedAbort:
+					r.waitForRunningTasks(runningTasks)
 					return result.Err
 				case TaskFailedRepeat:
-					doneTask.SetState(TaskStateNew)
-					waitingTasks = append(waitingTasks, doneTask)
+					doneTask.SetState(TaskStateRunning)
+					runningTasks = append(runningTasks, doneTask)
+					// Want to wait for some time before retrying
+					time.AfterFunc(defaultRepeatTaskTmo, func() {
+						doneTask.Run(r.resultChan)
+					})
 				}
 			} else {
+				doneTask.SetState(TaskStateDone)
 				waitingTasks = append(waitingTasks, r.getNextTasks(doneTask)...)
-				fmt.Printf("WaitingTasks: %v\n", waitingTasks)
 			}
 		}
 
@@ -134,21 +172,48 @@ func (r *Runner) gotInterrupt() bool {
 	}
 }
 
-func (r *Runner) getNextTasks(doneTask Task)[]Task {
+func (r *Runner) getNextTasks(doneTask Task) []Task {
 	retTasks := []Task{}
-	for _, nextTask := range r.tasksNext[doneTask.GetId()] {
+	for _, nextTask := range r.tasksNext[doneTask.GetID()] {
 		r.RemoveDependency(doneTask, nextTask)
 		// if nextTask does not have more dependencies add it to the retTasks
-		if len(r.tasksPrev[nextTask.GetId()]) == 0 {
+		if len(r.tasksPrev[nextTask.GetID()]) == 0 {
 			retTasks = append(retTasks, nextTask)
 		}
 	}
 	return retTasks
 }
 
+func (r *Runner) verifyTasksInRunner(tasks ...Task) error {
+	for _, t := range tasks {
+		if t == nil {
+			return fmt.Errorf("Task is nil! tasks: %v", tasks)
+		}
+		if foundTask := r.tasks[t.GetID()]; foundTask == nil {
+			return fmt.Errorf("%v not found", t)
+		}
+	}
+	return nil
+}
+
+func (r *Runner) waitForRunningTasks(runningTasks []Task) {
+	for len(runningTasks) > 0 {
+		select {
+		case result := <-r.resultChan:
+			doneTask := r.tasks[result.ID]
+			runningTasks = removeTaskFromSlice(runningTasks, doneTask)
+			if result.Err != nil {
+				doneTask.SetState(TaskStateFailed)
+			} else {
+				doneTask.SetState(TaskStateDone)
+			}
+		}
+	}
+}
+
 func removeTaskFromSlice(tasks []Task, task Task) []Task {
 	for i, t := range tasks {
-		if t.GetId() == task.GetId() {
+		if t.GetID() == task.GetID() {
 			tasks = append(tasks[:i], tasks[i+1:]...)
 		}
 	}
